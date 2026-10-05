@@ -2,7 +2,6 @@ import os
 import json
 import logging
 import asyncio
-import re
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
@@ -56,7 +55,8 @@ class RecommendationItem:
     providers_id: List[str] = field(default_factory=list)
     tomatometer: Optional[str] = None
     audience_score: Optional[str] = None
-    rotten_tomatoes_url: Optional[str] = None
+    imdb_rating: Optional[str] = None
+    tmdb_rating: Optional[str] = None
     tmdb_url: Optional[str] = None
 
 
@@ -156,91 +156,17 @@ async def fetch_tmdb_details(session: aiohttp.ClientSession, title: str, media_t
         return None
 
 
-async def fetch_rt_scorecard(session: aiohttp.ClientSession, url: str) -> Dict[str, Optional[str]]:
-    """Mengambil scorecard Rotten Tomatoes dari URL langsung."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4)) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                scripts = re.findall(r'<script[^>]*id="media-scorecard-json"[^>]*>(.*?)</script>', html, re.DOTALL)
-                if scripts:
-                    data = json.loads(scripts[0])
-                    tomatometer = data.get("criticsScore", {}).get("scorePercent")
-                    audience = data.get("audienceScore", {}).get("scorePercent")
-                    if tomatometer or audience:
-                        return {
-                            "tomatometer": tomatometer,
-                            "audience_score": audience,
-                            "url": url
-                        }
-    except Exception as e:
-        logger.debug(f"Gagal scrape RT {url}: {e}")
-    return {"tomatometer": None, "audience_score": None, "url": None}
-
-
-async def search_rt_url(session: aiohttp.ClientSession, title: str, media_type: str = "movie") -> Optional[str]:
-    """Mencari URL Rotten Tomatoes via pencarian web RT jika URL slug standar tidak ditemukan."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    search_url = f"https://www.rottentomatoes.com/search?search={title}"
-    try:
-        async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status == 200:
-                html = await resp.text()
-                prefix = "/tv/" if media_type == "tv" else "/m/"
-                matches = re.findall(r'href="(https://www\.rottentomatoes\.com' + re.escape(prefix) + r'[^"]+)"', html)
-                if matches:
-                    return matches[0]
-    except Exception as e:
-        logger.debug(f"Gagal search RT untuk {title}: {e}")
-    return None
-
-
-async def fetch_rotten_tomatoes_ratings(session: aiohttp.ClientSession, title: str, media_type: str = "movie", year: Optional[str] = None, tomato_url: Optional[str] = None) -> Dict[str, Optional[str]]:
-    """Mencari skor Rotten Tomatoes resmi (Tomatometer & Audience Score/Popcornmeter). Khusus Rotten Tomatoes saja, tanpa rating IMDb."""
-    # 1. Coba dari tomatoURL yang disediakan OMDb jika ada
-    if tomato_url and tomato_url.startswith("http"):
-        res = await fetch_rt_scorecard(session, tomato_url)
-        if res["tomatometer"] or res["audience_score"]:
-            return res
-
-    # 2. Coba candidate slug URL Rotten Tomatoes
-    clean_title = re.sub(r'[^a-zA-Z0-9]+', '_', title.lower()).strip('_')
-    prefix = "tv" if media_type == "tv" else "m"
-    candidate_urls = []
-    if year:
-        candidate_urls.append(f"https://www.rottentomatoes.com/{prefix}/{clean_title}_{year}")
-    candidate_urls.append(f"https://www.rottentomatoes.com/{prefix}/{clean_title}")
-
-    for url in candidate_urls:
-        res = await fetch_rt_scorecard(session, url)
-        if res["tomatometer"] or res["audience_score"]:
-            return res
-
-    # 3. Fallback pencarian langsung ke Rotten Tomatoes jika slug tidak cocok
-    search_match = await search_rt_url(session, title, media_type)
-    if search_match:
-        res = await fetch_rt_scorecard(session, search_match)
-        if res["tomatometer"] or res["audience_score"]:
-            return res
-
-    return {"tomatometer": None, "audience_score": None, "url": None}
-
-
 async def fetch_omdb_ratings(session: aiohttp.ClientSession, imdb_id: Optional[str] = None, title: Optional[str] = None, year: Optional[str] = None) -> Dict[str, Optional[str]]:
-    """Mengambil data Rotten Tomatoes dari OMDb API."""
+    """Mengambil skor Rotten Tomatoes (Tomatometer & Audience), IMDb dari OMDb API."""
     result = {
         "tomatometer": None,
-        "tomato_url": None
+        "audience_score": None,
+        "imdb_rating": None
     }
     if not OMDB_API_KEY:
         return result
 
-    params = {"apikey": OMDB_API_KEY, "tomatoes": "true"}
+    params = {"apikey": OMDB_API_KEY}
     if imdb_id:
         params["i"] = imdb_id
     elif title:
@@ -255,14 +181,18 @@ async def fetch_omdb_ratings(session: aiohttp.ClientSession, imdb_id: Optional[s
             if resp.status == 200:
                 data = await resp.json()
                 if data.get("Response") == "True":
+                    # Parse IMDb
+                    imdb_val = data.get("imdbRating")
+                    if imdb_val and imdb_val != "N/A":
+                        result["imdb_rating"] = f"{imdb_val}/10"
+
                     # Parse Rotten Tomatoes dari list Ratings
                     for rating in data.get("Ratings", []):
                         if rating.get("Source") == "Rotten Tomatoes":
                             result["tomatometer"] = rating.get("Value")
 
-                    tomato_url = data.get("tomatoURL")
-                    if tomato_url and tomato_url != "N/A" and tomato_url.startswith("http"):
-                        result["tomato_url"] = tomato_url
+                    # OMDb kadang tidak menyertakan audience score secara eksplisit,
+                    # tapi beberapa data menyertakan boxoffice/metascore.
     except Exception as e:
         logger.error(f"Error calling OMDb API: {e}")
 
@@ -270,7 +200,7 @@ async def fetch_omdb_ratings(session: aiohttp.ClientSession, imdb_id: Optional[s
 
 
 async def enrich_recommendation(rec: RecommendationItem) -> RecommendationItem:
-    """Mengisi data visual & metadata TMDB serta skor Rotten Tomatoes ke objek rekomendasi."""
+    """Mengisi data visual & metadata TMDB + OMDb ke objek rekomendasi."""
     async with aiohttp.ClientSession() as session:
         tmdb_data = await fetch_tmdb_details(
             session=session,
@@ -303,6 +233,11 @@ async def enrich_recommendation(rec: RecommendationItem) -> RecommendationItem:
             if synopsis:
                 rec.synopsis = synopsis[:300] + "..." if len(synopsis) > 300 else synopsis
 
+            # TMDB rating
+            vote_avg = tmdb_data.get("vote_average")
+            if vote_avg:
+                rec.tmdb_rating = f"{vote_avg:.1f}/10"
+
             # TMDB URL
             rec.tmdb_url = f"https://www.themoviedb.org/{rec.media_type}/{rec.tmdb_id}"
 
@@ -323,34 +258,18 @@ async def enrich_recommendation(rec: RecommendationItem) -> RecommendationItem:
             flatrate = providers_data.get("flatrate", [])
             rec.providers_id = [p["provider_name"] for p in flatrate]
 
-            # Rotten Tomatoes Rating (menggunakan OMDb & Rotten Tomatoes resmi)
+            # External IDs (IMDb ID)
             imdb_id = tmdb_data.get("external_ids", {}).get("imdb_id")
             omdb_info = await fetch_omdb_ratings(session, imdb_id=imdb_id, title=rec.title, year=rec.year)
-            
-            rt_data = await fetch_rotten_tomatoes_ratings(
-                session=session,
-                title=rec.title,
-                media_type=rec.media_type,
-                year=rec.year,
-                tomato_url=omdb_info.get("tomato_url")
-            )
-
-            rec.tomatometer = rt_data.get("tomatometer") or omdb_info.get("tomatometer") or rec.tomatometer
-            rec.audience_score = rt_data.get("audience_score") or rec.audience_score
-            rec.rotten_tomatoes_url = rt_data.get("url") or omdb_info.get("tomato_url")
+            rec.tomatometer = omdb_info.get("tomatometer")
+            rec.audience_score = omdb_info.get("audience_score")
+            rec.imdb_rating = omdb_info.get("imdb_rating")
         else:
-            # Fallback jika TMDB tidak ketemu
+            # Fallback OMDb langsung jika TMDB tidak ketemu
             omdb_info = await fetch_omdb_ratings(session, title=rec.title, year=rec.year)
-            rt_data = await fetch_rotten_tomatoes_ratings(
-                session=session,
-                title=rec.title,
-                media_type=rec.media_type,
-                year=rec.year,
-                tomato_url=omdb_info.get("tomato_url")
-            )
-            rec.tomatometer = rt_data.get("tomatometer") or omdb_info.get("tomatometer") or rec.tomatometer
-            rec.audience_score = rt_data.get("audience_score") or rec.audience_score
-            rec.rotten_tomatoes_url = rt_data.get("url") or omdb_info.get("tomato_url")
+            rec.tomatometer = omdb_info.get("tomatometer")
+            rec.audience_score = omdb_info.get("audience_score")
+            rec.imdb_rating = omdb_info.get("imdb_rating")
 
     return rec
 
@@ -375,16 +294,14 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
         "   - Prioritaskan film/series yang kamu ketahui tersedia di OTT tersebut khusus untuk region INDONESIA.\n"
         "   - Jika pengguna TIDAK menyebutkan OTT sama sekali, kamu bebas merekomendasikan tontonan terbaik apapun meski tidak ada di OTT streaming.\n"
         "4. JANGAN merekomendasikan judul yang ada di daftar 'EXCLUDED_TITLES' (karena user sudah pernah nonton atau sudah ditolak).\n"
-        "5. Gunakan HANYA rating dari Rotten Tomatoes (Tomatometer & Audience Score / Popcornmeter). JANGAN SEKALI-KALI menggunakan atau menampilkan rating IMDb karena dianggap kurang kredibel.\n"
-        "6. Output WAJIB dalam format JSON murni tanpa markdown triple backticks. Schema JSON:\n"
+        "5. Output WAJIB dalam format JSON murni tanpa markdown triple backticks. Schema JSON:\n"
         "{\n"
         '  "title": "Judul resmi film/series",\n'
         '  "year": "Tahun rilis misal 2021",\n'
         '  "media_type": "movie" ATAU "tv",\n'
         '  "reason": "Penjelasan singkat 1-2 kalimat mengapa ini sangat cocok dengan selera & permintaan user",\n'
         '  "requested_ott": ["Netflix", ...],\n'
-        '  "estimated_tomatometer": "90%",\n'
-        '  "estimated_audience_score": "88%"\n'
+        '  "estimated_tomatometer": "90%"\n'
         "}\n"
     )
 
@@ -398,24 +315,18 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
     try:
         # Jalankan di executor agar async
         loop = asyncio.get_running_loop()
-        
-        def _call_gemini():
-            for m in ["gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-3.8-flash"]:
-                try:
-                    return gemini_client.models.generate_content(
-                        model=m,
-                        contents=user_content,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction,
-                            response_mime_type="application/json",
-                            temperature=0.7
-                        )
-                    )
-                except Exception as ex:
-                    logger.warning(f"Gagal generate content dengan model {m}: {ex}")
-            raise RuntimeError("Semua model Gemini gagal dihubungi.")
-
-        response = await loop.run_in_executor(None, _call_gemini)
+        response = await loop.run_in_executor(
+            None,
+            lambda: gemini_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=user_content,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    response_mime_type="application/json",
+                    temperature=0.7
+                )
+            )
+        )
 
         response_text = response.text.strip()
         data = json.loads(response_text)
@@ -427,13 +338,10 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
             reason=data.get("reason", "")
         )
 
-        # Fallback tomatometer & audience score dari estimasi LLM jika API/scraping nantinya kosong
+        # Fallback tomatometer dari estimasi LLM jika API nantinya kosong
         est_tomato = data.get("estimated_tomatometer")
         if est_tomato:
             rec.tomatometer = str(est_tomato)
-        est_audience = data.get("estimated_audience_score")
-        if est_audience:
-            rec.audience_score = str(est_audience)
 
         # Update metadata session
         session.recommended_history.append(rec.title)
@@ -481,17 +389,19 @@ def create_recommendation_embed(rec: RecommendationItem, user_prompt: str) -> di
         ott_text = "*Tidak tersedia di OTT streaming langganan ID (Mungkin tersedia di bioskop/sewa fisik/VOD)*"
     embed.add_field(name="🇮🇩 Tersedia di (Region Indonesia)", value=ott_text, inline=False)
 
-    # Ratings (Hanya Rotten Tomatoes: Tomatometer & Audience Score / Popcornmeter)
+    # Ratings (Tomatometer, IMDb, TMDB)
     rating_parts = []
     if rec.tomatometer:
         rating_parts.append(f"🍅 **Tomatometer:** {rec.tomatometer}")
     if rec.audience_score:
         rating_parts.append(f"🍿 **Audience Score:** {rec.audience_score}")
+    if rec.imdb_rating:
+        rating_parts.append(f"⭐ **IMDb:** {rec.imdb_rating}")
+    elif rec.tmdb_rating:
+        rating_parts.append(f"🌟 **TMDB:** {rec.tmdb_rating}")
 
     if rating_parts:
-        embed.add_field(name="🍅 Skor Rotten Tomatoes", value="  |  ".join(rating_parts), inline=False)
-    else:
-        embed.add_field(name="🍅 Skor Rotten Tomatoes", value="*Belum tersedia di Rotten Tomatoes*", inline=False)
+        embed.add_field(name="📊 Skor & Rating", value="  |  ".join(rating_parts), inline=False)
 
     # Poster image
     if rec.poster_url:
@@ -516,17 +426,6 @@ class RecommendationView(discord.ui.View):
                     url=session.last_recommendation.tmdb_url,
                     style=discord.ButtonStyle.link,
                     emoji="🔗"
-                )
-            )
-
-        # Tambahkan Link Rotten Tomatoes Button jika ada URL
-        if session.last_recommendation and session.last_recommendation.rotten_tomatoes_url:
-            self.add_item(
-                discord.ui.Button(
-                    label="Rotten Tomatoes",
-                    url=session.last_recommendation.rotten_tomatoes_url,
-                    style=discord.ButtonStyle.link,
-                    emoji="🍅"
                 )
             )
 
