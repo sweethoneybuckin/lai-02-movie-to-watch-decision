@@ -313,9 +313,7 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
     if excluded:
         user_content += f"EXCLUDED_TITLES (JANGAN PILIH INI LAGI): {', '.join(excluded)}\n"
 
-    models_to_try = [GEMINI_MODEL]
-    if GEMINI_MODEL != "gemini-3.5-flash":
-        models_to_try.append("gemini-3.5-flash")
+    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]
 
     loop = asyncio.get_running_loop()
     for model_name in models_to_try:
