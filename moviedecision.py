@@ -18,6 +18,7 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
@@ -294,7 +295,7 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
         "   - Prioritaskan film/series yang kamu ketahui tersedia di OTT tersebut khusus untuk region INDONESIA.\n"
         "   - Jika pengguna TIDAK menyebutkan OTT sama sekali, kamu bebas merekomendasikan tontonan terbaik apapun meski tidak ada di OTT streaming.\n"
         "4. JANGAN merekomendasikan judul yang ada di daftar 'EXCLUDED_TITLES' (karena user sudah pernah nonton atau sudah ditolak).\n"
-        "5. Output WAJIB dalam format JSON murni tanpa markdown triple backticks. Schema JSON:\n"
+        "5. Output WAJIB berupa 1 (satu) objek JSON tunggal (BUKAN array/list [...], melainkan {...}) tanpa markdown triple backticks. Schema JSON:\n"
         "{\n"
         '  "title": "Judul resmi film/series",\n'
         '  "year": "Tahun rilis misal 2021",\n'
@@ -312,44 +313,69 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
     if excluded:
         user_content += f"EXCLUDED_TITLES (JANGAN PILIH INI LAGI): {', '.join(excluded)}\n"
 
-    try:
-        # Jalankan di executor agar async
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=user_content,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                    temperature=0.7
+    models_to_try = [GEMINI_MODEL]
+    if GEMINI_MODEL != "gemini-3.5-flash":
+        models_to_try.append("gemini-3.5-flash")
+
+    loop = asyncio.get_running_loop()
+    for model_name in models_to_try:
+        try:
+            # Jalankan di executor agar async
+            response = await loop.run_in_executor(
+                None,
+                lambda m=model_name: gemini_client.models.generate_content(
+                    model=m,
+                    contents=user_content,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        response_mime_type="application/json",
+                        temperature=0.7
+                    )
                 )
             )
-        )
 
-        response_text = response.text.strip()
-        data = json.loads(response_text)
+            response_text = response.text.strip()
+            # Bersihkan jika ada code block markdown
+            if response_text.startswith("```"):
+                lines = response_text.splitlines()
+                if lines and lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                response_text = "\n".join(lines).strip()
 
-        rec = RecommendationItem(
-            title=data.get("title", ""),
-            year=str(data.get("year", "")) if data.get("year") else None,
-            media_type=data.get("media_type", "movie").lower(),
-            reason=data.get("reason", "")
-        )
+            data = json.loads(response_text)
 
-        # Fallback tomatometer dari estimasi LLM jika API nantinya kosong
-        est_tomato = data.get("estimated_tomatometer")
-        if est_tomato:
-            rec.tomatometer = str(est_tomato)
+            # Jika model mengembalikan array/list [ {...} ], ambil elemen pertama
+            if isinstance(data, list):
+                if data and isinstance(data[0], dict):
+                    data = data[0]
+                else:
+                    raise ValueError(f"Format JSON list tidak sesuai: {data}")
 
-        # Update metadata session
-        session.recommended_history.append(rec.title)
-        return rec
+            if not isinstance(data, dict):
+                raise ValueError(f"Format JSON bukan object/dict: {type(data)}")
 
-    except Exception as e:
-        logger.error(f"Error calling Gemini: {e}")
-        return None
+            rec = RecommendationItem(
+                title=data.get("title", ""),
+                year=str(data.get("year", "")) if data.get("year") else None,
+                media_type=data.get("media_type", "movie").lower(),
+                reason=data.get("reason", "")
+            )
+
+            # Fallback tomatometer dari estimasi LLM jika API nantinya kosong
+            est_tomato = data.get("estimated_tomatometer")
+            if est_tomato:
+                rec.tomatometer = str(est_tomato)
+
+            # Update metadata session
+            session.recommended_history.append(rec.title)
+            return rec
+
+        except Exception as e:
+            logger.error(f"Error calling Gemini model '{model_name}': {e}")
+
+    return None
 
 
 # ==========================================
