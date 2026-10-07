@@ -18,7 +18,7 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
@@ -28,11 +28,16 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("MovieDecisionBot")
+# Redam warning AFC bawaan google_genai agar logs bersih
+logging.getLogger("google_genai").setLevel(logging.WARNING)
 
-# Initialize Gemini Client
+# Initialize Gemini Client with timeout (12 seconds)
 gemini_client = None
 if GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=12000)
+    )
 else:
     logger.warning("GEMINI_API_KEY belum diset di .env")
 
@@ -202,7 +207,8 @@ async def fetch_omdb_ratings(session: aiohttp.ClientSession, imdb_id: Optional[s
 
 async def enrich_recommendation(rec: RecommendationItem) -> RecommendationItem:
     """Mengisi data visual & metadata TMDB + OMDb ke objek rekomendasi."""
-    async with aiohttp.ClientSession() as session:
+    timeout = aiohttp.ClientTimeout(total=8)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         tmdb_data = await fetch_tmdb_details(
             session=session,
             title=rec.title,
@@ -313,26 +319,42 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
     if excluded:
         user_content += f"EXCLUDED_TITLES (JANGAN PILIH INI LAGI): {', '.join(excluded)}\n"
 
-    models_to_try = [GEMINI_MODEL, "gemini-3.8-flash", "gemini-2.0-flash"]
+    # Prioritaskan model user atau model flash yang aktif & cepat
+    preferred_model = GEMINI_MODEL or "gemini-3.5-flash-lite"
+    candidate_models = [
+        preferred_model,
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-3.6-flash",
+        "gemini-3.8-flash"
+    ]
+    models_to_try = []
+    for m in candidate_models:
+        if m and m not in models_to_try:
+            models_to_try.append(m)
 
-    loop = asyncio.get_running_loop()
     for model_name in models_to_try:
         try:
-            # Jalankan di executor agar async
-            response = await loop.run_in_executor(
-                None,
-                lambda m=model_name: gemini_client.models.generate_content(
-                    model=m,
+            logger.info(f"Mengirim request rekomendasi ke Gemini model: {model_name}...")
+            # Panggil Gemini secara asynchronous dengan timeout ketat (12 detik per request)
+            response = await asyncio.wait_for(
+                gemini_client.aio.models.generate_content(
+                    model=model_name,
                     contents=user_content,
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction,
                         response_mime_type="application/json",
                         temperature=0.7
                     )
-                )
+                ),
+                timeout=12.0
             )
 
-            response_text = response.text.strip()
+            response_text = response.text.strip() if response.text else ""
+            if not response_text:
+                logger.warning(f"Response kosong dari model {model_name}")
+                continue
+
             # Bersihkan jika ada code block markdown
             if response_text.startswith("```"):
                 lines = response_text.splitlines()
@@ -368,11 +390,15 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
 
             # Update metadata session
             session.recommended_history.append(rec.title)
+            logger.info(f"Berhasil mendapat rekomendasi: '{rec.title}' ({model_name})")
             return rec
 
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout (12s) saat memanggil Gemini model '{model_name}', mencoba model fallback...")
         except Exception as e:
-            logger.error(f"Error calling Gemini model '{model_name}': {e}")
+            logger.warning(f"Gagal memanggil Gemini model '{model_name}': {e}, mencoba model fallback...")
 
+    logger.error("Semua kandidat model Gemini gagal merespons.")
     return None
 
 
@@ -456,44 +482,56 @@ class RecommendationView(discord.ui.View):
     @discord.ui.button(label="Rekomendasi Lain", style=discord.ButtonStyle.secondary, emoji="🔄")
     async def another_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(thinking=True)
+        try:
+            rec = await get_ai_recommendation(self.session, new_instruction="User minta rekomendasi judul lain yang berbeda.")
+            if not rec:
+                await interaction.followup.send("Maaf, tidak dapat menemukan rekomendasi baru saat ini. Silakan coba sesaat lagi.", ephemeral=True)
+                return
 
-        rec = await get_ai_recommendation(self.session, new_instruction="User minta rekomendasi judul lain yang berbeda.")
-        if not rec:
-            await interaction.followup.send("Maaf, tidak dapat menemukan rekomendasi baru saat ini.", ephemeral=True)
-            return
+            rec = await enrich_recommendation(rec)
+            self.session.last_recommendation = rec
 
-        rec = await enrich_recommendation(rec)
-        self.session.last_recommendation = rec
-
-        embed = create_recommendation_embed(rec, self.session.original_prompt)
-        new_view = RecommendationView(self.session)
-        await interaction.followup.send(embed=embed, view=new_view)
+            embed = create_recommendation_embed(rec, self.session.original_prompt)
+            new_view = RecommendationView(self.session)
+            await interaction.followup.send(embed=embed, view=new_view)
+        except Exception as e:
+            logger.error(f"Error pada another_button: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(f"Terjadi kesalahan saat memproses: {e}", ephemeral=True)
+            except Exception:
+                pass
 
     @discord.ui.button(label="Udah Pernah Nonton", style=discord.ButtonStyle.primary, emoji="✅")
     async def watched_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(thinking=True)
+        try:
+            if self.session.last_recommendation:
+                self.session.watched_titles.append(self.session.last_recommendation.title)
 
-        if self.session.last_recommendation:
-            self.session.watched_titles.append(self.session.last_recommendation.title)
+            rec = await get_ai_recommendation(
+                self.session,
+                new_instruction=f"User sudah pernah menonton '{self.session.last_recommendation.title if self.session.last_recommendation else ''}'. Berikan tontonan lain yang belum pernah ditonton!"
+            )
+            if not rec:
+                await interaction.followup.send("Maaf, tidak dapat menemukan rekomendasi pengganti saat ini. Silakan coba sesaat lagi.", ephemeral=True)
+                return
 
-        rec = await get_ai_recommendation(
-            self.session,
-            new_instruction=f"User sudah pernah menonton '{self.session.last_recommendation.title if self.session.last_recommendation else ''}'. Berikan tontonan lain yang belum pernah ditonton!"
-        )
-        if not rec:
-            await interaction.followup.send("Maaf, tidak dapat menemukan rekomendasi pengganti saat ini.", ephemeral=True)
-            return
+            rec = await enrich_recommendation(rec)
+            self.session.last_recommendation = rec
 
-        rec = await enrich_recommendation(rec)
-        self.session.last_recommendation = rec
-
-        embed = create_recommendation_embed(rec, self.session.original_prompt)
-        new_view = RecommendationView(self.session)
-        await interaction.followup.send(
-            content=f"Oke, noted! Film sebelumnya dicatat sudah ditonton. Ini rekomendasi berikutnya untukmu:",
-            embed=embed,
-            view=new_view
-        )
+            embed = create_recommendation_embed(rec, self.session.original_prompt)
+            new_view = RecommendationView(self.session)
+            await interaction.followup.send(
+                content="Oke, noted! Film sebelumnya dicatat sudah ditonton. Ini rekomendasi berikutnya untukmu:",
+                embed=embed,
+                view=new_view
+            )
+        except Exception as e:
+            logger.error(f"Error pada watched_button: {e}", exc_info=True)
+            try:
+                await interaction.followup.send(f"Terjadi kesalahan saat memproses: {e}", ephemeral=True)
+            except Exception:
+                pass
 
 
 # ==========================================
@@ -520,26 +558,32 @@ async def on_ready():
 @app_commands.describe(permintaan="Contoh: saran film komedi indonesia yang ada di netflix jangan jadul")
 async def slash_tonton(interaction: discord.Interaction, permintaan: str):
     await interaction.response.defer(thinking=True)
+    try:
+        # Inisialisasi atau perbarui session user
+        user_id = interaction.user.id
+        session = UserSession(user_id=user_id, original_prompt=permintaan)
+        user_sessions[user_id] = session
 
-    # Inisialisasi atau perbarui session user
-    user_id = interaction.user.id
-    session = UserSession(user_id=user_id, original_prompt=permintaan)
-    user_sessions[user_id] = session
+        # 1. Panggil Gemini AI
+        rec = await get_ai_recommendation(session)
+        if not rec:
+            await interaction.followup.send("Waduh, terjadi kendala saat memproses rekomendasi AI. Silakan coba sesaat lagi.", ephemeral=True)
+            return
 
-    # 1. Panggil Gemini AI
-    rec = await get_ai_recommendation(session)
-    if not rec:
-        await interaction.followup.send("Waduh, terjadi kendala saat memproses rekomendasi AI. Pastikan API key sudah terpasang dengan benar.", ephemeral=True)
-        return
+        # 2. Enrich dengan data TMDB & OMDb (Poster, OTT ID, Tomatometer)
+        rec = await enrich_recommendation(rec)
+        session.last_recommendation = rec
 
-    # 2. Enrich dengan data TMDB & OMDb (Poster, OTT ID, Tomatometer)
-    rec = await enrich_recommendation(rec)
-    session.last_recommendation = rec
-
-    # 3. Render Embed & View Buttons
-    embed = create_recommendation_embed(rec, permintaan)
-    view = RecommendationView(session)
-    await interaction.followup.send(embed=embed, view=view)
+        # 3. Render Embed & View Buttons
+        embed = create_recommendation_embed(rec, permintaan)
+        view = RecommendationView(session)
+        await interaction.followup.send(embed=embed, view=view)
+    except Exception as e:
+        logger.error(f"Error handling slash_tonton: {e}", exc_info=True)
+        try:
+            await interaction.followup.send(f"Terjadi kesalahan saat memproses permintaan: {e}", ephemeral=True)
+        except Exception:
+            pass
 
 
 @bot.command(name="tonton", aliases=["watch", "film", "rekomendasi"])
@@ -549,21 +593,25 @@ async def prefix_tonton(ctx: commands.Context, *, permintaan: str = ""):
         return
 
     async with ctx.typing():
-        user_id = ctx.author.id
-        session = UserSession(user_id=user_id, original_prompt=permintaan)
-        user_sessions[user_id] = session
+        try:
+            user_id = ctx.author.id
+            session = UserSession(user_id=user_id, original_prompt=permintaan)
+            user_sessions[user_id] = session
 
-        rec = await get_ai_recommendation(session)
-        if not rec:
-            await ctx.reply("Waduh, terjadi kendala saat memproses rekomendasi AI. Cek konfigurasi API key.")
-            return
+            rec = await get_ai_recommendation(session)
+            if not rec:
+                await ctx.reply("Waduh, terjadi kendala saat memproses rekomendasi AI. Cek konfigurasi API key.")
+                return
 
-        rec = await enrich_recommendation(rec)
-        session.last_recommendation = rec
+            rec = await enrich_recommendation(rec)
+            session.last_recommendation = rec
 
-        embed = create_recommendation_embed(rec, permintaan)
-        view = RecommendationView(session)
-        await ctx.reply(embed=embed, view=view)
+            embed = create_recommendation_embed(rec, permintaan)
+            view = RecommendationView(session)
+            await ctx.reply(embed=embed, view=view)
+        except Exception as e:
+            logger.error(f"Error handling prefix_tonton: {e}", exc_info=True)
+            await ctx.reply(f"Terjadi kendala saat memproses rekomendasi: {e}")
 
 
 @bot.event
