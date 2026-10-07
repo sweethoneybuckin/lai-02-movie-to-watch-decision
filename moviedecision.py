@@ -18,7 +18,7 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 OMDB_API_KEY = os.getenv("OMDB_API_KEY")
 
@@ -313,7 +313,7 @@ async def get_ai_recommendation(session: UserSession, new_instruction: Optional[
     if excluded:
         user_content += f"EXCLUDED_TITLES (JANGAN PILIH INI LAGI): {', '.join(excluded)}\n"
 
-    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-1.5-flash"]
+    models_to_try = [GEMINI_MODEL, "gemini-3.8-flash", "gemini-2.0-flash"]
 
     loop = asyncio.get_running_loop()
     for model_name in models_to_try:
